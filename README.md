@@ -2,6 +2,14 @@
 
 Blockchain-based petroleum supply chain ledger on a P2P network (Seed nodes + Peer nodes).
 
+## Description
+
+This project implements a blockchain-backed petroleum supply chain ledger on top of a P2P network.
+The network consists of seed nodes (for discovery and registration) and peer nodes (for gossiping,
+transaction validation, liveness checks, and PoW-style block mining). Each node uses secp256k1 keys,
+derives a 16-bit wallet address from SHA-256 of the public key, and signs transactions with ECDSA.
+Blocks are mined via an exponential waiting time based on each miner’s hash power.
+
 ## Requirements
 
 - Python 3.8+
@@ -23,6 +31,18 @@ Blockchain-based petroleum supply chain ledger on a P2P network (Seed nodes + Pe
 - `experiments/` — Task 1–7 scripts and answers
 
 ## How to Run
+
+### 0. Setup (Install Dependencies)
+
+```bash
+python -m pip install -r requirements.txt
+```
+
+If `requirements.txt` is not used, install manually:
+
+```bash
+python -m pip install ecdsa matplotlib
+```
 
 ### 1. Start seed nodes (at least ⌊n/2⌋+1 for n seeds)
 
@@ -52,6 +72,18 @@ python submit_tx.py 127.0.0.1 8000 0x0001 "100 barrels delivered to Refinery A"
 ```
 
 Peers will gossip the TX, validate the signature, and miners will include it in the next block (exponential waiting time).
+
+### 4. Run Experimental Tasks (Optional)
+
+```bash
+python experiments/task1_avalanche.py
+python experiments/task2_merkle.py
+python experiments/task3_double_spend.py
+python experiments/task4_51_percent.py
+python experiments/task5_commitment.py
+python experiments/task6_target_leading_zeros.py
+python experiments/task7_stochastic.py
+```
 
 ## Experimental Tasks (Run and Report)
 
