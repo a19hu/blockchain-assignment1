@@ -10,7 +10,7 @@ Blockchain-based petroleum supply chain ledger on a P2P network (Seed nodes + Pe
 
 ## Project Layout
 
-- `crypto_utils.py` — secp256k1, SHA-256, address (last 16 bits of SHA256(pk)), ECDSA sign/verify
+- `crypto_utils.py` — secp256k1, SHA-256, address (last 16 bits of SHA256(pk)), Double-and-Add pk derivation, ECDSA sign/verify
 - `wallet.py` — key generation (SHA256(random) → sk), address derivation
 - `transaction.py` — TxID = SHA256(contents), ECDSA signature
 - `block.py` — block structure and hash

@@ -24,7 +24,7 @@ from config import (
 )
 from wallet import Wallet
 from transaction import create_transaction, verify_transaction, tx_to_bytes, tx_from_bytes
-from block import create_block, block_to_bytes, block_from_bytes
+from block import create_block, block_to_bytes, block_from_bytes, compute_block_hash
 from block_db import (
     get_db_path,
     init_db,
@@ -62,14 +62,18 @@ class PeerNode:
         self.pending_blocks = []  # blocks to validate and append
         self.pending_txs = []  # unconfirmed transactions
         self.mining_abort = False
+        self.mining_interrupt = threading.Event()
         self.longest_chain_height = get_max_height(self.db_path)
         self.seeds = [(SEED_HOST, p) for p in SEED_PORTS[:NUM_SEEDS]]
         self.liveness_fail_count = {}  # (ip, port) -> consecutive failures
+        self.liveness_state = {}  # (ip, port) -> {"fail": int, "awaiting": bool}
         self.genesis_hash = "0" * 64  # placeholder genesis
 
-    def _gossip_id(self, timestamp: float, ip: str, msg_num: int) -> str:
-        s = f"{timestamp}:{ip}:{msg_num}"
-        return sha256_hash(s.encode())
+    def _gossip_msg(self, timestamp: float, ip: str, msg_num: int) -> str:
+        return f"{timestamp}:{ip}:{msg_num}"
+
+    def _gossip_id_from_msg(self, msg: str) -> str:
+        return sha256_hash(msg.encode())
 
     def _register_with_seeds(self):
         n = NUM_SEEDS
@@ -116,9 +120,10 @@ class PeerNode:
         return unique
 
     def _connect_to_peers(self, peer_list: list):
-        need = max(MIN_PEERS, len(peer_list))
+        random.shuffle(peer_list)
+        need = min(len(peer_list), max(MIN_PEERS, 4))
         connected = 0
-        for pe in peer_list:
+        for pe in peer_list[:need]:
             if connected >= need:
                 break
             ip, port = pe["ip"], pe["port"]
@@ -132,6 +137,12 @@ class PeerNode:
                     self.peer_connections[key] = s
                     self.conn_to_peer[s] = key
                     self.liveness_fail_count[key] = 0
+                    self.liveness_state[key] = {"fail": 0, "awaiting": False}
+                try:
+                    s.send(encode_message({"type": "HELLO", "port": self.my_port}))
+                    print(f"[Peer {self.my_port}] Sent HELLO to {ip}:{port}")
+                except Exception:
+                    pass
                 connected += 1
                 threading.Thread(target=self._recv_loop, args=(s,), daemon=True).start()
             except Exception as e:
@@ -139,6 +150,7 @@ class PeerNode:
         print(f"[Peer {self.my_port}] Connected to {connected} peers")
 
     def _report_dead(self, dead_ip: str, dead_port: int):
+        report = f"Dead Node:{dead_ip}:{dead_port}:{time.time()}:{self.my_host}"
         for (h, p) in self.seeds:
             try:
                 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -149,6 +161,7 @@ class PeerNode:
                     "dead_ip": dead_ip,
                     "dead_port": dead_port,
                     "reporter_ip": self.my_host,
+                    "report": report,
                 }))
                 read_message(s)
                 s.close()
@@ -160,6 +173,7 @@ class PeerNode:
             s = self.peer_connections.pop(key, None)
             if s:
                 self.conn_to_peer.pop(s, None)
+                self.liveness_state.pop(key, None)
                 try:
                     s.close()
                 except Exception:
@@ -196,7 +210,10 @@ class PeerNode:
     def _handle_message(self, msg: dict, from_conn: socket.socket):
         typ = msg.get("type")
         if typ == "GOSSIP_TX":
-            gid = msg.get("gossip_id")
+            gossip_msg = msg.get("gossip_msg")
+            gid = self._gossip_id_from_msg(gossip_msg) if gossip_msg else msg.get("gossip_id")
+            if not gid:
+                return
             if gid and gid in self.message_list:
                 return
             tx_data = msg.get("tx")
@@ -209,7 +226,10 @@ class PeerNode:
                 self.pending_txs.append(tx_data)
             self._broadcast(msg, exclude_socket=from_conn)
         elif typ == "GOSSIP_BLOCK":
-            gid = msg.get("gossip_id")
+            gossip_msg = msg.get("gossip_msg")
+            gid = self._gossip_id_from_msg(gossip_msg) if gossip_msg else msg.get("gossip_id")
+            if not gid:
+                return
             if gid and gid in self.message_list:
                 return
             block_data = msg.get("block")
@@ -219,7 +239,8 @@ class PeerNode:
             with self.lock:
                 self.pending_blocks.append((block_data, from_conn))
             self._broadcast(msg, exclude_socket=from_conn)
-            self.mining_abort = True
+            if block_data.get("Height", -1) > self.longest_chain_height:
+                self.mining_abort = True
         elif typ == "LIVENESS_REQ":
             try:
                 from_conn.send(encode_message({"type": "LIVENESS_RESP"}))
@@ -230,9 +251,39 @@ class PeerNode:
                 if from_conn in self.conn_to_peer:
                     key = self.conn_to_peer[from_conn]
                     self.liveness_fail_count[key] = 0
+                    if key in self.liveness_state:
+                        self.liveness_state[key]["fail"] = 0
+                        self.liveness_state[key]["awaiting"] = False
+        elif typ == "HELLO":
+            listen_port = msg.get("port")
+            if not listen_port:
+                return
+            with self.lock:
+                old_key = self.conn_to_peer.get(from_conn)
+                new_key = (old_key[0], listen_port) if old_key else None
+                if not new_key:
+                    return
+                existing = self.peer_connections.get(new_key)
+                if existing and existing is not from_conn:
+                    try:
+                        from_conn.close()
+                    except Exception:
+                        pass
+                    return
+                if old_key in self.peer_connections:
+                    self.peer_connections.pop(old_key, None)
+                    self.liveness_fail_count.pop(old_key, None)
+                    self.liveness_state.pop(old_key, None)
+                self.peer_connections[new_key] = from_conn
+                self.conn_to_peer[from_conn] = new_key
+                self.liveness_fail_count[new_key] = 0
+                self.liveness_state[new_key] = {"fail": 0, "awaiting": False}
+            print(f"[Peer {self.my_port}] Handshake from {new_key[0]}:{new_key[1]}")
         elif typ == "GET_BLOCKS":
             from_height = msg.get("from_height", 0)
             to_height = msg.get("to_height", -1)
+            if to_height < 0:
+                to_height = get_max_height(self.db_path)
             blocks = []
             for h in range(from_height, to_height + 1):
                 b = get_block_by_height(self.db_path, h)
@@ -277,17 +328,28 @@ class PeerNode:
                     with self.lock:
                         self.pending_blocks.append((block, None))
                 break
+            prev_height = self.longest_chain_height
             insert_block(self.db_path, block)
             self.longest_chain_height = max(self.longest_chain_height, block["Height"])
             self.msg_counter += 1
-            gid = self._gossip_id(time.time(), f"{self.my_host}:{self.my_port}", self.msg_counter)
+            gossip_msg = self._gossip_msg(time.time(), self.my_host, self.msg_counter)
+            gid = self._gossip_id_from_msg(gossip_msg)
             self.message_list.add(gid)
-            self._broadcast({"type": "GOSSIP_BLOCK", "gossip_id": gid, "block": block})
+            self._broadcast({"type": "GOSSIP_BLOCK", "gossip_id": gid, "gossip_msg": gossip_msg, "block": block})
+            with self.lock:
+                if block["Height"] > prev_height and not self.pending_blocks:
+                    self.mining_interrupt.set()
 
     def _validate_block(self, block: dict) -> bool:
         if block_hash_exists(self.db_path, block["BlockHash"]):
             return False
         if abs(block["Timestamp"] - time.time()) > BLOCK_TIME_TOLERANCE:
+            return False
+        tx_hashes = [t["TxID"] for t in block.get("Transactions", [])]
+        if block.get("TxHashes") and sorted(block["TxHashes"]) != sorted(tx_hashes):
+            return False
+        computed = compute_block_hash(block["PrevHash"], block["Height"], block["Timestamp"], tx_hashes)
+        if computed != block["BlockHash"]:
             return False
         if block["Height"] > 0 and not get_block_by_hash(self.db_path, block["PrevHash"]):
             return False  # parent not yet in chain
@@ -299,16 +361,30 @@ class PeerNode:
             with self.lock:
                 to_check = list(self.peer_connections.items())
             for key, s in to_check:
+                with self.lock:
+                    state = self.liveness_state.get(key, {"fail": 0, "awaiting": False})
+                    if state["awaiting"]:
+                        state["fail"] += 1
+                    self.liveness_state[key] = state
+                    if state["fail"] >= LIVENESS_FAIL_THRESHOLD:
+                        self._report_dead(key[0], key[1])
+                        self._close_peer(key)
+                        continue
                 try:
                     s.send(encode_message({"type": "LIVENESS_REQ"}))
+                    with self.lock:
+                        if key in self.liveness_state:
+                            self.liveness_state[key]["awaiting"] = True
                 except Exception:
                     with self.lock:
-                        self.liveness_fail_count[key] = self.liveness_fail_count.get(key, 0) + 1
-                        if self.liveness_fail_count[key] >= LIVENESS_FAIL_THRESHOLD:
+                        state = self.liveness_state.get(key, {"fail": 0, "awaiting": False})
+                        state["fail"] += 1
+                        state["awaiting"] = False
+                        self.liveness_state[key] = state
+                        if state["fail"] >= LIVENESS_FAIL_THRESHOLD:
                             self._report_dead(key[0], key[1])
                             self._close_peer(key)
                             continue
-                # We don't wait for response here; response clears counter in _handle_message
 
     def _mining_loop(self):
         mean_tk = 1.0 / INTERARRIVAL_TIME
@@ -320,34 +396,29 @@ class PeerNode:
                     time.sleep(0.5)
                     continue
                 txs = list(self.pending_txs)[:10] if self.pending_txs else []
-            # Mine only when we have txs (or allow empty for genesis - already done in init)
-            if not txs:
-                time.sleep(0.5)
-                continue
             latest = get_block_by_height(self.db_path, self.longest_chain_height)
             prev_hash = latest["BlockHash"] if latest else self.genesis_hash
             next_height = self.longest_chain_height + 1
             tau = random.expovariate(lambda_) if lambda_ > 0 else 10.0
-            tau_sec = max(0.1, min(tau, 60.0))
             self.mining_abort = False
-            deadline = time.time() + tau_sec
-            while time.time() < deadline and not self.mining_abort:
+            self.mining_interrupt.clear()
+            deadline = time.time() + tau
+            while time.time() < deadline and not self.mining_abort and not self.mining_interrupt.is_set():
                 time.sleep(0.2)
                 self._process_pending_blocks()
-            if self.mining_abort:
+            if self.mining_abort or self.mining_interrupt.is_set():
                 continue
             # Mine block
             with self.lock:
                 txs = [self.pending_txs.pop(0) for _ in range(min(len(self.pending_txs), 10))] if self.pending_txs else []
-            if not txs:
-                continue
             block = create_block(prev_hash, next_height, txs)
             insert_block(self.db_path, block)
             self.longest_chain_height = next_height
             self.msg_counter += 1
-            gid = self._gossip_id(time.time(), f"{self.my_host}:{self.my_port}", self.msg_counter)
+            gossip_msg = self._gossip_msg(time.time(), self.my_host, self.msg_counter)
+            gid = self._gossip_id_from_msg(gossip_msg)
             self.message_list.add(gid)
-            self._broadcast({"type": "GOSSIP_BLOCK", "gossip_id": gid, "block": block})
+            self._broadcast({"type": "GOSSIP_BLOCK", "gossip_id": gid, "gossip_msg": gossip_msg, "block": block})
             print(f"[Peer {self.my_port}] Mined block height={next_height}")
 
     def _listen(self):
@@ -363,6 +434,12 @@ class PeerNode:
                 self.peer_connections[key] = conn
                 self.conn_to_peer[conn] = key
                 self.liveness_fail_count[key] = 0
+                self.liveness_state[key] = {"fail": 0, "awaiting": False}
+            try:
+                conn.send(encode_message({"type": "HELLO", "port": self.my_port}))
+                print(f"[Peer {self.my_port}] Sent HELLO to {key[0]}:{key[1]}")
+            except Exception:
+                pass
             threading.Thread(target=self._recv_loop, args=(conn,), daemon=True).start()
 
     def run(self):

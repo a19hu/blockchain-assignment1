@@ -23,8 +23,9 @@ def main():
     data = sys.argv[4] if len(sys.argv) > 4 else "100 barrels delivered to Refinery A"
     wallet = Wallet()
     tx = create_transaction(wallet, receiver, data)
-    gossip_id = sha256_hash(f"{time.time()}:{host}:0".encode())
-    msg = {"type": "GOSSIP_TX", "gossip_id": gossip_id, "tx": tx}
+    gossip_msg = f"{time.time()}:{host}:0"
+    gossip_id = sha256_hash(gossip_msg.encode())
+    msg = {"type": "GOSSIP_TX", "gossip_id": gossip_id, "gossip_msg": gossip_msg, "tx": tx}
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(5)

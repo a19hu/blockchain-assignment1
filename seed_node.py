@@ -47,7 +47,11 @@ class SeedNode:
                 dead_ip = msg.get("dead_ip")
                 dead_port = msg.get("dead_port")
                 reporter = msg.get("reporter_ip")
-                print(f"[Seed:{self.port}] Dead node report: {dead_ip}:{dead_port} (from {reporter})")
+                report = msg.get("report")
+                if report:
+                    print(f"[Seed:{self.port}] {report}")
+                else:
+                    print(f"[Seed:{self.port}] Dead node report: {dead_ip}:{dead_port} (from {reporter})")
                 with self.lock:
                     self.peer_list = [p for p in self.peer_list if not (p["ip"] == dead_ip and p["port"] == dead_port)]
                 conn.send(encode_message({"type": "OK"}))
